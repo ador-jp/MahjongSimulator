@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: transparent; overflow: hidden; font-family: sans-serif; }
+  /* Reserve space above for tooltips */
+  .mj-hand-outer {
+    padding-top: 100px;
+    padding-bottom: 4px;
+  }
+  .mj-hand {
+    display: flex;
+    gap: 3px;
+    justify-content: center;
+    flex-wrap: nowrap;
+  }
+  .mj-tile-wrap {
+    position: relative;
+    display: inline-block;
+  }
+  .mj-tile-wrap img {
+    height: 60px;
+    border-radius: 3px;
+    display: block;
+  }
+  .mj-tile-wrap.clickable {
+    cursor: pointer;
+  }
+  .mj-tile-wrap.clickable:hover img {
+    outline: 2px solid #ffd700;
+  }
+  .mj-tooltip {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(20, 20, 30, 0.96);
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 8px;
+    white-space: nowrap;
+    z-index: 9999;
+    font-size: 12px;
+    line-height: 1.6;
+    pointer-events: none;
+    border: 1px solid #666;
+    min-width: 170px;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.6);
+  }
+  .mj-tile-wrap:hover .mj-tooltip {
+    display: block;
+  }
+</style>
+</head>
+<body>
+<div class="mj-hand-outer">
+  <div class="mj-hand" id="hand-container"></div>
+</div>
+<script>
+  function sendToStreamlit(type, data) {
+    var msg = Object.assign({ isStreamlitMessage: true, type: type }, data);
+    window.parent.postMessage(msg, "*");
+  }
+
+  function updateHeight() {
+    var h = document.querySelector(".mj-hand-outer").scrollHeight;
+    sendToStreamlit("streamlit:setFrameHeight", { height: h });
+  }
+
+  function renderHand(args) {
+    var tiles = args.tiles || [];
+    var clickable = args.clickable || false;
+    var container = document.getElementById("hand-container");
+    container.innerHTML = "";
+
+    tiles.forEach(function(tile, idx) {
+      var wrap = document.createElement("div");
+      wrap.className = "mj-tile-wrap" + (clickable ? " clickable" : "");
+
+      var img = document.createElement("img");
+      img.src = tile.src;
+      wrap.appendChild(img);
+
+      if (tile.info) {
+        var tooltip = document.createElement("div");
+        tooltip.className = "mj-tooltip";
+        tooltip.innerHTML = tile.info;
+        wrap.appendChild(tooltip);
+      }
+
+      if (clickable) {
+        wrap.addEventListener("click", function() {
+          sendToStreamlit("streamlit:setComponentValue", { value: idx });
+        });
+      }
+
+      container.appendChild(wrap);
+    });
+
+    setTimeout(updateHeight, 50);
+  }
+
+  window.addEventListener("message", function(event) {
+    if (event.data.type === "streamlit:render") {
+      renderHand(event.data.args);
+    }
+  });
+
+  sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>
