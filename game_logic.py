@@ -13,6 +13,7 @@ from mahjong.tile import TilesConverter
 from mahjong.hand_calculating.hand import HandCalculator
 from mahjong.hand_calculating.hand_config import HandConfig
 from mahjong.meld import Meld
+import ai_weights as _aw
 
 shanten_calculator = Shanten()
 hand_calculator = HandCalculator()
@@ -106,6 +107,21 @@ def calculate_shanten(hand_13):
 
 
 def calculate_shanten_14(hand_14):
+    """
+    14枚手牌のシャンテン数を返す。
+    和了形（完成）の場合は -1、テンパイは 0。
+    まず14枚のまま和了チェック（-1判定）し、
+    非和了の場合は13枚ループで最小シャンテンを求める。
+    """
+    # 和了チェック: 14枚のシャンテンが -1 なら完成
+    try:
+        tiles_34 = tiles_to_34(hand_14)
+        sh = shanten_calculator.calculate_shanten(tiles_34)
+        if sh == -1:
+            return -1
+    except Exception:
+        pass
+    # 非和了: 1枚ずつ除いた13枚の最小シャンテンを返す
     min_shanten = 99
     for i in range(len(hand_14)):
         remaining = hand_14[:i] + hand_14[i + 1:]
@@ -365,21 +381,23 @@ def _evaluate_hand_raw(hand_14, context=None):
         tile = hand_14[i]
         safety_raw = _tile_safety_score(tile, rivers, player_name, riichi_players)
 
+        w = _aw.get()
+        _sh_table = {int(k): v for k, v in w["sh_table"].items()}
+
         # --- 1. シャンテン点 (0–50) ---
-        sh_score = {-1: 50, 0: 46, 1: 30, 2: 15, 3: 7}.get(sh, max(0, 4 - sh))
+        sh_score = _sh_table.get(sh, max(0, 4 - sh))
 
-        # --- 2. 重み付き受け入れ枚数点 (0–40) ---
-        # 理想的なイーシャンテン手 ~28枚(7種×4枚)を基準に正規化
-        acc_score = min(40.0, weighted_count / 28.0 * 40.0)
+        # --- 2. 重み付き受け入れ枚数点 ---
+        acc_score = min(w["acc_max"], weighted_count / w["acc_norm"] * w["acc_max"])
 
-        # --- 3. ドラ点 (残り手牌のドラ枚数×5, 最大20点 / 捨てがドラなら–10) ---
+        # --- 3. ドラ点 ---
         dora_kept = sum(1 for t in remaining if base_tile(t) in dora_set)
-        dora_score = min(20.0, dora_kept * 5.0)
+        dora_score = min(w["dora_max"], dora_kept * w["dora_per_tile"])
         if base_tile(tile) in dora_set:
-            dora_score -= 10.0
+            dora_score -= w["dora_discard_penalty"]
 
         # --- 4. 安全度点 (リーチ数に応じて重みを増加) ---
-        safety_weight = 0.15 + riichi_count * 0.08
+        safety_weight = w["safety_base"] + riichi_count * w["safety_per_riichi"]
         safety_score = safety_raw * safety_weight
 
         # --- 5. 場況補正 ---
@@ -388,19 +406,19 @@ def _evaluate_hand_raw(hand_14, context=None):
             my_score = scores.get(player_name, 25000)
             others = [v for k, v in scores.items() if k != player_name]
             lead = my_score - max(others) if others else 0
-            is_late = wall_count <= 20
-            is_very_late = wall_count <= 10
+            is_late = wall_count <= w["late_wall"]
+            is_very_late = wall_count <= w["very_late_wall"]
             if riichi_count >= 1 and is_late:
-                situation_score += safety_raw / 100 * 10
-            if lead >= 8000 and is_late:
-                situation_score += safety_raw / 100 * 5
+                situation_score += safety_raw / 100 * w["riichi_late_bonus"]
+            if lead >= w["lead_threshold"] and is_late:
+                situation_score += safety_raw / 100 * w["lead_late_bonus"]
             if is_very_late:
-                situation_score += safety_raw / 100 * 4
+                situation_score += safety_raw / 100 * w["very_late_bonus"]
             if sh == 0:
-                situation_score += 4
+                situation_score += w["tenpai_bonus"]
                 # メンゼンテンパイはリーチ可能 → 追加ボーナス
                 if not has_melds and scores.get(player_name, 25000) >= 1000:
-                    situation_score += 4
+                    situation_score += w["riichi_eligible_bonus"]
 
         raw_total = sh_score + acc_score + dora_score + safety_score + situation_score
 
@@ -1023,4 +1041,13 @@ def evaluate_discard(hand_14, player_discard_idx, context=None):
         "best_score": best_score,
         "top_candidates": top_candidates,
         "ai_thinking": ai_thinking,
+        # コンポーネントスコア（ロギング・チューニング用）
+        "player_sh_score": player_cand.get("sh_score", 0),
+        "player_acc_score": player_cand.get("acc_score", 0),
+        "player_dora_score": player_cand.get("dora_score", 0),
+        "player_safety_score": player_cand.get("safety_score", 0),
+        "player_situation_score": player_cand.get("situation_score", 0),
+        "player_raw_total": player_cand.get("raw_total", 0),
+        "best_raw_total": best.get("raw_total", 0),
+        "all_candidates": all_candidates,  # 全候補（ログ用、最大14件）
     }

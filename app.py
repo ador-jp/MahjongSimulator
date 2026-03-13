@@ -7,6 +7,12 @@ from pathlib import Path
 
 import streamlit.components.v1 as _components
 from st_clickable_images import clickable_images
+import ai_weights
+import game_log
+from game_logic import _evaluate_hand_score as _eval_candidates
+
+# 起動時にai_weights.jsonを読み込む（チューニング済みパラメータを反映）
+ai_weights.load()
 
 _COMPONENT_DIR = Path(__file__).parent / "tile_hover_component"
 _tile_hover_component = _components.declare_component(
@@ -168,6 +174,7 @@ def _init_round_state(scores, round_number, dealer, honba, riichi_pot):
         "riichi_pending": False,
         "dealer": dealer,
         "honba": honba,
+        "decision_log": [],  # 牌譜ログ（局ごとにリセット）
     }
 
 
@@ -180,6 +187,10 @@ if "gs" not in st.session_state:
         riichi_pot=0,
     )
     st.session_state.gs = initial_state
+
+# 和了ログ（半荘をまたいで保持）
+if "win_log" not in st.session_state:
+    st.session_state.win_log = []
 
 GS = st.session_state.gs
 
@@ -217,6 +228,14 @@ def start_new_round(renchan: bool = False):
     st.session_state.gs = new_state
 
 
+def start_new_game():
+    """半荘終了後に新しい半荘を開始する（点数リセット）"""
+    initial_scores = {p: 25000 for p in PLAYER_ORDER}
+    new_state = _init_round_state(initial_scores, round_number=1, dealer="Player", honba=0, riichi_pot=0)
+    new_state["eval_history"] = GS.get("eval_history", [])
+    st.session_state.gs = new_state
+
+
 # ==========================================
 # 副露アクション
 # ==========================================
@@ -248,6 +267,39 @@ def handle_player_chi(from_player, discard_tile, idx1, idx2):
 # ==========================================
 # ゲームアクション
 # ==========================================
+_TENPAI_PAYMENT = {1: (1000, 3000), 2: (1500, 1500), 3: (3000, 1000)}
+# (非テンパイ1人あたりの支払い, テンパイ1人あたりの受け取り)
+
+def _apply_tenpai_payments():
+    """流局時テンパイ払いを適用する。戻り値: {player: delta}"""
+    tenpai = [p for p in PLAYER_ORDER if is_tenpai(GS["hands"][p][:13])]
+    n = len(tenpai)
+    if n == 0 or n == 4:
+        return {}
+    non_tenpai = [p for p in PLAYER_ORDER if p not in tenpai]
+    pay, recv = _TENPAI_PAYMENT[n]
+    for p in non_tenpai:
+        GS["scores"][p] -= pay
+    for p in tenpai:
+        GS["scores"][p] += recv
+    return {p: (recv if p in tenpai else -pay) for p in PLAYER_ORDER}
+
+
+def _finalize_and_save_log(game_result: dict, scores_before: dict):
+    """局終了時に牌譜を確定させてディスクに保存する"""
+    log = GS.get("decision_log", [])
+    if not log:
+        return
+    game_log.finalize_round(log, game_result, scores_before, GS["scores"])
+    game_log.save_round_log(
+        round_number=GS["round_number"],
+        decision_log=log,
+        game_result=game_result,
+        scores_before=scores_before,
+        scores_after=GS["scores"],
+    )
+
+
 def _discard_min_required():
     """副露有無に応じた打牌に必要な最低手牌枚数"""
     has_meld = bool(GS["melds"]["Player"])
@@ -286,6 +338,15 @@ def handle_player_discard(idx):
         eval_result = evaluate_discard(hand_before, idx, context=context)
         GS["last_eval"] = eval_result
         GS["eval_history"].append(eval_result)
+        # 牌譜ログ
+        GS["decision_log"].append(game_log.make_player_decision(
+            round_number=GS["round_number"],
+            turn_count=GS["turn_count"],
+            hand_14=hand_before,
+            chosen_idx=idx,
+            eval_result=eval_result,
+            context=context,
+        ))
 
     # 打牌処理
     tile = GS["hands"]["Player"].pop(idx)
@@ -311,6 +372,7 @@ def handle_player_discard(idx):
             GS["game_result"] = {
                 "type": "ron", "winner": cp, "loser": "Player",
                 "tile": tile, "details": fmt, "winner_hand": winner_hand,
+                "scores_before": dict(GS["scores"]),
             }
             points = fmt["main_points"]
             GS["scores"]["Player"] -= points
@@ -318,13 +380,12 @@ def handle_player_discard(idx):
             if GS["riichi_pot"] > 0:
                 GS["scores"][cp] += GS["riichi_pot"]
                 GS["riichi_pot"] = 0
+            _finalize_and_save_log(GS["game_result"], GS["game_result"]["scores_before"])
             st.rerun()
             return
 
-    # リーチ確定
+    # リーチ確定（供託はボタン押下時に既に引いている）
     if GS.get("riichi_pending"):
-        GS["scores"]["Player"] -= 1000
-        GS["riichi_pot"] += 1000
         GS["riichi"]["Player"] = True
         GS["riichi_pending"] = False
 
@@ -364,11 +425,13 @@ def handle_cpu_turn(cp):
             "type": "tsumo", "winner": cp,
             "tile": GS["hands"][cp][-1], "details": fmt,
             "winner_hand": winner_hand,
+            "scores_before": dict(GS["scores"]),
         }
         apply_tsumo_points(cp, fmt)
         if GS["riichi_pot"] > 0:
             GS["scores"][cp] += GS["riichi_pot"]
             GS["riichi_pot"] = 0
+        _finalize_and_save_log(GS["game_result"], GS["game_result"]["scores_before"])
         st.rerun()
         return
 
@@ -380,6 +443,27 @@ def handle_cpu_turn(cp):
         "dora_indicators": GS.get("dora_indicators", [GS["dora_indicator"]]),
     }
     best_idx, _ = find_best_discard(GS["hands"][cp], context=context)
+
+    # 牌譜ログ（全候補スコアを取得して記録）
+    _cpu_candidates = _eval_candidates(GS["hands"][cp], context=context)
+    GS["decision_log"].append(game_log.make_cpu_decision(
+        round_number=GS["round_number"],
+        turn_count=GS["turn_count"],
+        player=cp,
+        hand_14=list(GS["hands"][cp]),
+        chosen_idx=best_idx,
+        candidates=_cpu_candidates,
+        context=context,
+    ))
+
+    # リーチ判定（副露なし・未リーチ・1000点以上）
+    if not GS["riichi"][cp] and not GS["melds"].get(cp) and GS["scores"][cp] >= 1000:
+        hand_after_discard = [t for i, t in enumerate(GS["hands"][cp]) if i != best_idx]
+        if calculate_shanten(hand_after_discard) == 0:
+            GS["riichi"][cp] = True
+            GS["scores"][cp] -= 1000
+            GS["riichi_pot"] += 1000
+
     tile = GS["hands"][cp].pop(best_idx)
     GS["rivers"][cp].append(tile)
     GS["hands"][cp].sort(key=tile_sort_key)
@@ -466,6 +550,118 @@ if GS["eval_history"] and show_ai_eval:
     st.sidebar.markdown(f"最善手率: **{rate:.0f}%** ({strictly_best}/{total})")
     st.sidebar.markdown(f"平均スコア: **{avg_score:.1f}** /100点")
 
+# --- AIチューニング用語解説 ---
+st.sidebar.markdown("---")
+with st.sidebar.expander("📖 AI用語解説", expanded=False):
+    st.markdown("""
+**シャンテン数 (Shanten)**
+和了までに必要な交換回数。-1=和了、0=テンパイ、1=一向聴…
+
+**受け入れ枚数 (Acceptance)**
+ツモれば手が進む牌の残り枚数。数が多いほど進みやすい。
+
+**regret（後悔値）**
+実際に選んだ打牌と「最善手」のスコア差。0に近いほど最適な選択。
+
+**ron_dealt（放銃）**
+自分が切った牌で相手にロンされた回数。
+
+**最善手率 (Optimal rate)**
+AIが最もスコアの高い牌を選べた割合（%）。
+
+**評価軸別 過小評価度**
+- **シャンテン**: AIがシャンテン進行を低く見積もった度合
+- **受け入れ**: 受け入れ枚数の価値を低く見積もった度合
+- **ドラ**: ドラ保持価値を低く見積もった度合
+- **安全**: 相手への安全度を低く見積もった度合
+
+**テンパイ bonus**
+テンパイ時にスコアに加算されるボーナス。大きいほどテンパイ維持を優先。
+
+**リーチ bonus**
+リーチ可能なテンパイ時の追加ボーナス。大きいほどリーチを積極的に宣言。
+
+**安全 base / riichi+**
+安全度スコアの重み。`base` は基本重み、`riichi+` はリーチ者がいる時の追加重み。
+
+**acc_max / acc_norm**
+受け入れ点の上限と正規化基準。`acc_norm` 枚の受け入れで `acc_max` 点になる。
+""")
+
+# --- 牌譜分析 ---
+with st.sidebar.expander("📊 牌譜分析・AIチューニング", expanded=False):
+    log_exists = game_log.LOG_FILE.exists()
+    if log_exists:
+        rounds = game_log.load_logs(max_rounds=200)
+        st.caption(f"記録済み局数: **{len(rounds)}**")
+    else:
+        rounds = []
+        st.caption("まだ牌譜がありません。オートプレイで対局してください。")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        run_analysis = st.button("🔍 分析実行", use_container_width=True)
+    with col_b:
+        if st.button("🗑 ログ削除", use_container_width=True):
+            game_log.clear_logs()
+            st.rerun()
+
+    if run_analysis and rounds:
+        analysis = game_log.analyze(rounds)
+        game_log.save_analysis_cache(analysis)
+        st.session_state["_analysis_result"] = analysis
+
+    analysis = st.session_state.get("_analysis_result") or game_log.load_analysis_cache()
+    if analysis:
+        n = analysis.get("total_rounds", 0)
+        st.markdown(f"**集計局数: {n}**")
+        st.markdown(
+            f"勝率 **{analysis['win_rate']:.0f}%** / "
+            f"流局 **{analysis['draw_rate']:.0f}%** / "
+            f"失点 **{analysis['lose_rate']:.0f}%**"
+        )
+        st.markdown(
+            f"最善手率 **{analysis['optimal_rate']:.0f}%** | "
+            f"平均regret **{analysis['avg_regret']:.1f}**"
+        )
+        st.markdown(
+            f"放銃率 **{analysis['ron_dealt_rate']:.0f}%** "
+            f"（回避可能: {analysis['ron_avoidable']}件）"
+        )
+        cr = analysis.get("comp_regret", {})
+        if cr:
+            st.caption("評価軸別の過小評価度（正＝その軸を低く見積もっている）")
+            st.caption(
+                f"シャンテン:{cr.get('sh',0):+.1f} "
+                f"受け入れ:{cr.get('acc',0):+.1f} "
+                f"ドラ:{cr.get('dora',0):+.1f} "
+                f"安全:{cr.get('safety',0):+.1f}"
+            )
+
+        # チューニング提案
+        weight_diff, notes = game_log.suggest_tuning(analysis)
+        st.markdown("**調整案:**")
+        for note in notes:
+            st.caption(f"• {note}")
+
+        if weight_diff:
+            if st.button("⚙️ AIに適用して保存", type="primary", use_container_width=True):
+                game_log.apply_tuning(weight_diff)
+                st.success("重みを更新しました。次の局から反映されます。")
+                st.rerun()
+
+    # 現在の重みを表示
+    with st.expander("現在のAI重み", expanded=False):
+        w = ai_weights.get()
+        st.caption(f"安全: base={w['safety_base']:.3f} / riichi+={w['safety_per_riichi']:.3f}")
+        st.caption(f"受け入れ: max={w['acc_max']:.1f} / norm={w['acc_norm']:.1f}")
+        st.caption(f"ドラ: {w['dora_per_tile']:.1f}pt/枚 max={w['dora_max']:.1f}")
+        st.caption(f"テンパイ bonus={w['tenpai_bonus']:.1f} / リーチ+={w['riichi_eligible_bonus']:.1f}")
+        if st.button("🔄 デフォルトにリセット", use_container_width=True):
+            ai_weights.reset_to_default()
+            st.success("デフォルト重みに戻しました。")
+            st.rerun()
+
 # --- 場・局・風表示 ---
 round_info = get_round_info(GS["round_number"])
 dealer = _current_dealer()
@@ -519,8 +715,40 @@ if GS["game_over"] and GS["game_result"]:
             )
 
     st.markdown("---")
+    scores_before = result.get("scores_before", {})
+    if scores_before:
+        st.markdown("### 点数変動")
+        delta_cols = st.columns(4)
+        player_labels = {"Player": "あなた", "CPU1": "CPU1", "CPU2": "CPU2", "CPU3": "CPU3"}
+        for i, p in enumerate(PLAYER_ORDER):
+            with delta_cols[i]:
+                before = scores_before.get(p, GS["scores"][p])
+                after = GS["scores"][p]
+                delta = after - before
+                name = player_labels.get(p, p)
+                delta_str = f"+{delta:,}" if delta > 0 else f"{delta:,}" if delta < 0 else "±0"
+                color = "#4caf50" if delta > 0 else "#f44336" if delta < 0 else "#888"
+                st.markdown(f"**{name}**")
+                st.markdown(
+                    f"<span style='color:{color};font-weight:bold;font-size:1.1em;'>{delta_str}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"{after:,}点")
     is_renchan = (not is_draw) and (result.get("winner") == _current_dealer())
-    if GS["round_number"] >= 8 and not is_renchan:
+    is_hanchan_over = GS["round_number"] >= 8 and not is_renchan
+
+    # オートプレイ時は自動進行
+    if auto_play:
+        time.sleep(0.3)
+        if is_hanchan_over:
+            start_new_game()
+        elif is_renchan:
+            start_new_round(renchan=True)
+        else:
+            start_new_round(renchan=False)
+        st.rerun()
+
+    if is_hanchan_over:
         st.markdown("🏁 半荘終了（リセットで新しい半荘を開始できます）")
     else:
         if is_renchan:
@@ -572,21 +800,23 @@ def _player_label(p):
     return f"{name} {dealer_icon}{riichi_icon}{turn_icon} ({wind}家)"
 
 
-def _river_tiles_html_rows(p, rotate_deg=0, per_row=6):
-    """河の牌HTMLを生成。1行per_row枚で折り返し。rotate_degで各牌を回転"""
+def _river_tiles_html_rows(p, rotate_deg=0, per_row=6, reverse_rows=False):
+    """河の牌HTMLを生成。1行per_row枚で折り返し。reverse_rows=Trueで最新行を先頭に"""
     tiles = GS["rivers"][p]
     if not tiles:
         return ""
-    rows_html = ""
     rot = f"transform:rotate({rotate_deg}deg);" if rotate_deg else ""
+    rows = []
     for row_start in range(0, len(tiles), per_row):
         row = tiles[row_start:row_start + per_row]
         row_html = "".join(
             f'<img src="{get_tile_b64(t, "1")}" style="height:42px;margin:1px;{rot}">'
             for t in row
         )
-        rows_html += f'<div style="display:flex;">{row_html}</div>'
-    return rows_html
+        rows.append(f'<div style="display:flex;">{row_html}</div>')
+    if reverse_rows:
+        rows.reverse()
+    return "".join(rows)
 
 
 # セルスタイルの共通設定
@@ -595,15 +825,16 @@ _cell_base = "background:rgba(0,0,0,0.35);border-radius:6px;padding:4px;"
 # 横河（上・下）のHTMLブロック生成（1行6枚折り返し）
 def _horiz_river_block(p, rotate=False):
     lbl = _player_label(p)
-    river_html = _river_tiles_html_rows(p, rotate_deg=180 if rotate else 0, per_row=6)
+    # CPU2（上）: 新しい行が手前（上）→ reverse_rows=True
+    river_html = _river_tiles_html_rows(p, rotate_deg=180 if rotate else 0, per_row=6, reverse_rows=rotate)
     meld_html = _make_meld_html(GS["melds"].get(p, []))
-    label_style = "text-align:center;color:#eee;font-size:0.8em;margin-bottom:2px;"
+    label_style = "text-align:left;color:#eee;font-size:0.8em;margin-bottom:2px;"
     if rotate:
         # CPU2（上）はラベルを下に
         return (
             f'<div style="{_cell_base}min-height:80px;">'
-            f'<div style="display:flex;flex-direction:column;align-items:center;min-height:60px;">{river_html}</div>'
-            f'<div style="display:flex;flex-wrap:wrap;justify-content:center;">{meld_html}</div>'
+            f'<div style="display:flex;flex-direction:column;align-items:flex-start;min-height:60px;">{river_html}</div>'
+            f'<div style="display:flex;flex-wrap:wrap;justify-content:flex-start;">{meld_html}</div>'
             f'<div style="{label_style}">{lbl}</div>'
             f'</div>'
         )
@@ -611,30 +842,37 @@ def _horiz_river_block(p, rotate=False):
         return (
             f'<div style="{_cell_base}min-height:80px;">'
             f'<div style="{label_style}">{lbl}</div>'
-            f'<div style="display:flex;flex-direction:column;align-items:center;min-height:60px;">{river_html}</div>'
-            f'<div style="display:flex;flex-wrap:wrap;justify-content:center;">{meld_html}</div>'
+            f'<div style="display:flex;flex-direction:column;align-items:flex-start;min-height:60px;">{river_html}</div>'
+            f'<div style="display:flex;flex-wrap:wrap;justify-content:flex-start;">{meld_html}</div>'
             f'</div>'
         )
 
 
 # 縦河（左・右）HTMLブロック生成（横向き牌style "2"を1列6枚で縦並べ）
-def _vert_river_block(p, align="center", rotate_deg=0):
+def _vert_river_block(p, rotate_deg=0, reverse_cols=False):
+    """
+    reverse_cols=True: 新しい列を左側（手前）に配置（CPU3用）
+    reverse_cols=False: 新しい列を右側（手前）に配置（CPU1用）
+    """
     lbl = _player_label(p)
     tiles = GS["rivers"][p]
     rot = f"transform:rotate({rotate_deg}deg);" if rotate_deg else ""
     # 6枚ずつ列に分ける
-    cols_html = ""
+    columns = []
     for col_start in range(0, max(len(tiles), 1), 6):
         col_tiles = tiles[col_start:col_start + 6]
         col_imgs = "".join(
             f'<img src="{get_tile_b64(t, "2")}" style="height:38px;margin:2px;display:block;{rot}">'
             for t in col_tiles
         )
-        cols_html += f'<div style="display:flex;flex-direction:column;align-items:center;">{col_imgs}</div>'
+        columns.append(f'<div style="display:flex;flex-direction:column;align-items:center;">{col_imgs}</div>')
+    if reverse_cols:
+        columns.reverse()
+    cols_html = "".join(columns)
     meld_html = _make_meld_html(GS["melds"].get(p, []))
     label_style = "color:#eee;font-size:0.75em;writing-mode:vertical-rl;text-orientation:mixed;margin:4px 0;"
     return (
-        f'<div style="{_cell_base}display:flex;flex-direction:column;align-items:{align};justify-content:center;min-width:80px;">'
+        f'<div style="{_cell_base}display:flex;flex-direction:column;align-items:flex-start;justify-content:center;min-width:80px;">'
         f'<div style="{label_style}">{lbl}</div>'
         f'<div style="display:flex;flex-direction:row;">{cols_html}</div>'
         f'<div>{meld_html}</div>'
@@ -671,9 +909,9 @@ table_html = f"""
   margin-bottom:4px;
 ">
   <div style="grid-column:1/4;">{_horiz_river_block("CPU2", rotate=True)}</div>
-  {_vert_river_block("CPU3", align="center", rotate_deg=180)}
+  {_vert_river_block("CPU3", rotate_deg=180, reverse_cols=True)}
   {center_html}
-  {_vert_river_block("CPU1", align="center", rotate_deg=0)}
+  {_vert_river_block("CPU1", rotate_deg=0, reverse_cols=False)}
   <div style="grid-column:1/4;">{_horiz_river_block("Player", rotate=False)}</div>
 </div>
 """
@@ -808,6 +1046,7 @@ if GS.get("ron_available") and not GS["game_over"]:
         GS["game_result"] = {
             "type": "ron", "winner": "Player", "loser": ron_info["from"],
             "tile": ron_info["tile"], "details": fmt, "winner_hand": winner_hand,
+            "scores_before": dict(GS["scores"]),
         }
         points = fmt["main_points"]
         GS["scores"][ron_info["from"]] -= points
@@ -816,6 +1055,7 @@ if GS.get("ron_available") and not GS["game_over"]:
             GS["scores"]["Player"] += GS["riichi_pot"]
             GS["riichi_pot"] = 0
         GS["ron_available"] = None
+        _finalize_and_save_log(GS["game_result"], GS["game_result"]["scores_before"])
 
     if auto_play:
         _do_ron()
@@ -908,12 +1148,14 @@ if GS["turn"] == "Player" and GS.get("tsumo_available") and not GS["game_over"]:
             "type": "tsumo", "winner": "Player",
             "tile": tsumo_info["tile"], "details": fmt,
             "winner_hand": winner_hand,
+            "scores_before": dict(GS["scores"]),
         }
         apply_tsumo_points("Player", fmt)
         if GS["riichi_pot"] > 0:
             GS["scores"]["Player"] += GS["riichi_pot"]
             GS["riichi_pot"] = 0
         del GS["tsumo_available"]
+        _finalize_and_save_log(GS["game_result"], GS["game_result"]["scores_before"])
 
     if auto_play:
         _do_tsumo()
@@ -1005,8 +1247,11 @@ if GS["turn"] == "Player" and not GS["game_over"] and not GS.get("ron_available"
     # まだツモっていないならツモる
     if not GS["has_drawn"]:
         if not GS["wall"]:
+            scores_before_draw = dict(GS["scores"])
+            _apply_tenpai_payments()
             GS["game_over"] = True
-            GS["game_result"] = {"type": "exhaustive_draw"}
+            GS["game_result"] = {"type": "exhaustive_draw", "scores_before": scores_before_draw}
+            _finalize_and_save_log(GS["game_result"], scores_before_draw)
             st.rerun()
         new_tile = GS["wall"].pop()
         GS["hands"]["Player"].append(new_tile)
@@ -1032,11 +1277,13 @@ if GS["turn"] == "Player" and not GS["game_over"] and not GS.get("ron_available"
                     "type": "tsumo", "winner": "Player",
                     "tile": new_tile, "details": fmt,
                     "winner_hand": winner_hand,
+                    "scores_before": dict(GS["scores"]),
                 }
                 apply_tsumo_points("Player", fmt)
                 if GS["riichi_pot"] > 0:
                     GS["scores"]["Player"] += GS["riichi_pot"]
                     GS["riichi_pot"] = 0
+                _finalize_and_save_log(GS["game_result"], GS["game_result"]["scores_before"])
                 st.rerun()
             else:
                 GS["tsumo_available"] = {
@@ -1063,6 +1310,13 @@ if GS["turn"] == "Player" and not GS["game_over"] and not GS.get("ron_available"
                 "melds": GS["melds"].get("Player"),
             }
             best_idx, _ = find_best_discard(GS["hands"]["Player"], context=_ap_context)
+            # リーチ判定（副露なし・未リーチ・1000点以上）
+            if not GS["melds"]["Player"] and GS["scores"]["Player"] >= 1000:
+                hand_after_ap = [t for i, t in enumerate(GS["hands"]["Player"]) if i != best_idx]
+                if calculate_shanten(hand_after_ap) == 0:
+                    GS["riichi"]["Player"] = True
+                    GS["scores"]["Player"] -= 1000
+                    GS["riichi_pot"] += 1000
             handle_player_discard(best_idx)
 
     # 手動打牌
@@ -1085,8 +1339,11 @@ elif GS["turn"] != "Player" and not GS["game_over"]:
 
     if not GS["has_drawn"]:
         if not GS["wall"]:
+            scores_before_draw = dict(GS["scores"])
+            _apply_tenpai_payments()
             GS["game_over"] = True
-            GS["game_result"] = {"type": "exhaustive_draw"}
+            GS["game_result"] = {"type": "exhaustive_draw", "scores_before": scores_before_draw}
+            _finalize_and_save_log(GS["game_result"], scores_before_draw)
             st.rerun()
         GS["hands"][cp].append(GS["wall"].pop())
         GS["has_drawn"] = True

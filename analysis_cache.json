@@ -1,0 +1,24 @@
+{
+  "total_rounds": 200,
+  "total_player_decisions": 2575,
+  "win_rate": 21.0,
+  "draw_rate": 25.5,
+  "lose_rate": 53.5,
+  "avg_regret": 0.63,
+  "riichi_regret": 1.98,
+  "normal_regret": 0.01,
+  "ron_dealt_rate": 226.0,
+  "ron_avoidable": 15,
+  "optimal_rate": 95.0,
+  "comp_regret": {
+    "sh": 3.96,
+    "acc": 1.66,
+    "dora": 1.62,
+    "safety": -14.26
+  },
+  "outcomes": {
+    "lose": 107,
+    "win": 42,
+    "draw": 51
+  }
+}
