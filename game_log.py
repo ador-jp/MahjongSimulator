@@ -74,13 +74,24 @@ def _decision_snapshot(
     }
 
 
+_BEST_MOVE_TIE_KEYS = ("sh", "raw_total", "weighted_acc", "safety_raw")
+
+
 def is_best_move(eval_result: dict) -> bool:
-    """AI最善手と同点（100点）の打牌も最善手として扱う。"""
+    """AI最善手と全順位キーで同点の打牌も最善手として扱う（攻撃・守備局面とも）。"""
     if eval_result.get("is_strictly_best", False):
         return True
-    if "total_score" not in eval_result:
+    candidates = eval_result.get("all_candidates") or []
+    if not candidates:
         return False
-    return eval_result["total_score"] >= eval_result.get("best_score", 100.0)
+    best = candidates[0]
+    chosen = next(
+        (c for c in candidates if c.get("tile") == eval_result.get("player_tile")),
+        None,
+    )
+    if chosen is None:
+        return False
+    return all(chosen.get(key) == best.get(key) for key in _BEST_MOVE_TIE_KEYS)
 
 
 def count_best_moves(eval_results: list) -> int:

@@ -269,6 +269,38 @@ class BestMoveRateTests(unittest.TestCase):
         self.assertFalse(game_log.is_best_move({"grade": "—", "is_strictly_best": False}))
         self.assertEqual(2, game_log.count_best_moves([tied, best, worse]))
 
+    def test_dangerous_discard_rounded_to_100_in_defense_is_not_best_move(self):
+        hand = [
+            "6z", "7s", "2p", "8p", "1p", "3s", "8s",
+            "2z", "5m", "2m", "9s", "7p", "1s", "8m",
+        ]
+        context = {
+            "player": "Player",
+            "rivers": {
+                "CPU1": ["4m", "9p", "1z"],
+                "CPU2": ["2m", "4p", "9m"],
+                "CPU3": [],
+            },
+            "riichi": {"CPU1": True, "CPU2": True},
+            "wall_count": 40,
+            "scores": {
+                "Player": 25000,
+                "CPU1": 24000,
+                "CPU2": 24000,
+                "CPU3": 25000,
+            },
+        }
+        dangerous = game_logic.evaluate_discard(hand, hand.index("6z"), context=context)
+        self.assertFalse(dangerous["is_strictly_best"])
+        self.assertEqual(100.0, dangerous["total_score"])
+        best_candidate = dangerous["all_candidates"][0]
+        chosen_candidate = next(
+            c for c in dangerous["all_candidates"] if c["tile"] == "6z"
+        )
+        self.assertLess(chosen_candidate["safety_raw"], best_candidate["safety_raw"])
+
+        self.assertFalse(game_log.is_best_move(dangerous))
+
 
 if __name__ == "__main__":
     unittest.main()
