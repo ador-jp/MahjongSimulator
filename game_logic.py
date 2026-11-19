@@ -514,18 +514,6 @@ def _evaluate_hand_score(hand_14, context=None):
     return _normalize_to_100(raw)
 
 
-def _tile_safety(tile, rivers, current_player):
-    if not rivers or current_player is None:
-        return 0
-    score = 0
-    for name, river in rivers.items():
-        if name == current_player:
-            continue
-        if base_tile(tile) in [base_tile(r) for r in river]:
-            score += 1
-    return score
-
-
 # ==========================================
 # 状況適応コメント生成
 # ==========================================
