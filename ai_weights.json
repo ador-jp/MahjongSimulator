@@ -1,0 +1,27 @@
+{
+  "sh_table": {
+    "0": 100,
+    "1": 65,
+    "2": 38,
+    "3": 20,
+    "4": 10,
+    "5": 4,
+    "6": 0
+  },
+  "safety_base": 0.06,
+  "safety_per_riichi": 0.17,
+  "acc_max": 20.0,
+  "acc_norm": 24.0,
+  "dora_per_tile": 4.0,
+  "dora_max": 20.0,
+  "dora_discard_penalty": 8.0,
+  "late_wall": 30,
+  "very_late_wall": 10,
+  "riichi_late_bonus": 18.0,
+  "lead_threshold": 3000,
+  "lead_late_bonus": 12.0,
+  "very_late_bonus": 15.0,
+  "tenpai_bonus": 6.0,
+  "riichi_eligible_bonus": 4.0,
+  "context_profiles": {}
+}
