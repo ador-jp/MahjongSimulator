@@ -8,11 +8,13 @@
 - AI思考表示・ホバープレビュー
 """
 
+from functools import lru_cache
 from mahjong.shanten import Shanten
 from mahjong.tile import TilesConverter
 from mahjong.hand_calculating.hand import HandCalculator
 from mahjong.hand_calculating.hand_config import HandConfig
 from mahjong.meld import Meld
+from decision_context import classify_context
 import ai_weights as _aw
 
 shanten_calculator = Shanten()
@@ -98,37 +100,24 @@ def tile_to_label(tile):
 # シャンテン数計算
 # ==========================================
 
+@lru_cache(maxsize=200_000)
+def _calculate_shanten_cached(tiles_34):
+    return shanten_calculator.calculate_shanten(list(tiles_34))
+
+
 def calculate_shanten(hand_13):
     try:
-        tiles_34 = tiles_to_34(hand_13)
-        return shanten_calculator.calculate_shanten(tiles_34)
+        return _calculate_shanten_cached(tuple(tiles_to_34(hand_13)))
     except Exception:
         return 99
 
 
 def calculate_shanten_14(hand_14):
-    """
-    14枚手牌のシャンテン数を返す。
-    和了形（完成）の場合は -1、テンパイは 0。
-    まず14枚のまま和了チェック（-1判定）し、
-    非和了の場合は13枚ループで最小シャンテンを求める。
-    """
-    # 和了チェック: 14枚のシャンテンが -1 なら完成
+    """14枚手牌を直接評価する。和了形は-1、テンパイは0。"""
     try:
-        tiles_34 = tiles_to_34(hand_14)
-        sh = shanten_calculator.calculate_shanten(tiles_34)
-        if sh == -1:
-            return -1
+        return _calculate_shanten_cached(tuple(tiles_to_34(hand_14)))
     except Exception:
-        pass
-    # 非和了: 1枚ずつ除いた13枚の最小シャンテンを返す
-    min_shanten = 99
-    for i in range(len(hand_14)):
-        remaining = hand_14[:i] + hand_14[i + 1:]
-        sh = calculate_shanten(remaining)
-        if sh < min_shanten:
-            min_shanten = sh
-    return min_shanten
+        return 99
 
 
 # ==========================================
@@ -251,37 +240,73 @@ def build_melds_136(melds_info):
 # ==========================================
 
 def _tile_safety_score(tile, rivers, current_player, riichi_players=None):
+    """打牌の安全度を0〜100で返す。リーチ者の河を最優先する。"""
     if not rivers or current_player is None:
         return 30
-    safe_count = 0
-    riichi_players = riichi_players or {}
-    for name, river in rivers.items():
-        if name == current_player:
-            continue
-        bt = base_tile(tile)
-        river_bases = [base_tile(r) for r in river]
-        if bt in river_bases:
-            safe_count += 1
-    if safe_count >= 3:
-        return 100
-    if safe_count == 2:
-        return 75
-    if safe_count == 1:
-        return 50
+
     bt = base_tile(tile)
-    score = _base_safety_by_tile_type(bt)
-    riichi_count = sum(1 for p, r in riichi_players.items() if r and p != current_player)
-    # 序盤補正: 他家の合計捨て牌が少ないほど安全度を底上げ（リーチなし時のみ）
-    if riichi_count == 0:
-        total_opponent_discards = sum(
-            len(r) for n, r in rivers.items() if n != current_player
+    riichi_players = riichi_players or {}
+    riichi_targets = [
+        name
+        for name, declared in riichi_players.items()
+        if declared and name != current_player and name in rivers
+    ]
+
+    if riichi_targets:
+        visible_count = sum(
+            1
+            for river in rivers.values()
+            for discarded in river
+            if base_tile(discarded) == bt
         )
-        # 0捨て → +45, 9捨て(3×3) → +0 と線形補間
-        if total_opponent_discards < 9:
-            early_bonus = int((9 - total_opponent_discards) / 9 * 45)
-            score = min(100, score + early_bonus)
-    score = max(0, score - riichi_count * 10)
-    return score
+        # 複数リーチ時は、全員に対して安全な牌を優先する。
+        return min(
+            _safety_against_riichi(bt, rivers.get(name, ()), visible_count)
+            for name in riichi_targets
+        )
+
+    score = _base_safety_by_tile_type(bt)
+    visible_count = sum(
+        1
+        for name, river in rivers.items()
+        if name != current_player
+        for discarded in river
+        if base_tile(discarded) == bt
+    )
+    total_opponent_discards = sum(
+        len(river) for name, river in rivers.items() if name != current_player
+    )
+    early_bonus = max(0, int((9 - total_opponent_discards) / 9 * 35))
+    return min(100, score + early_bonus + visible_count * 5)
+
+
+def _safety_against_riichi(bt, river, visible_count):
+    """単独のリーチ者に対する現物・字牌・スジの安全度を返す。"""
+    river_bases = {base_tile(discarded) for discarded in river}
+    if bt in river_bases:
+        return 100
+
+    if bt[1] == "z":
+        return min(95, 20 + visible_count * 25)
+
+    try:
+        number = int(bt[0])
+    except ValueError:
+        return 15
+
+    suji_numbers = {
+        1: (4,), 2: (5,), 3: (6,),
+        4: (1, 7), 5: (2, 8), 6: (3, 9),
+        7: (4,), 8: (5,), 9: (6,),
+    }[number]
+    suji_hits = sum(
+        1 for suji in suji_numbers if f"{suji}{bt[1]}" in river_bases
+    )
+    if len(suji_numbers) == 1:
+        suji_bonus = 18 if suji_hits else 0
+    else:
+        suji_bonus = 12 * suji_hits
+    return min(80, _base_safety_by_tile_type(bt) + suji_bonus)
 
 
 def _base_safety_by_tile_type(bt):
@@ -361,6 +386,13 @@ def _evaluate_hand_raw(hand_14, context=None):
     riichi_players = context.get("riichi") if context else {}
     dora_indicators = context.get("dora_indicators", []) if context else []
     has_melds = bool(context.get("melds")) if context else False
+    context_features = classify_context(
+        hand_14,
+        context,
+        shanten=calculate_shanten_14(hand_14),
+    )
+    weight_override = context.get("weights_override") if context else None
+    weights = _aw.resolve(context_features["key"], weights=weight_override)
 
     riichi_count = sum(1 for p, r in (riichi_players or {}).items() if r and p != player_name)
 
@@ -381,10 +413,10 @@ def _evaluate_hand_raw(hand_14, context=None):
         tile = hand_14[i]
         safety_raw = _tile_safety_score(tile, rivers, player_name, riichi_players)
 
-        w = _aw.get()
-        _sh_table = {int(k): v for k, v in w["sh_table"].items()}
+        w = weights
+        _sh_table = {int(k): value for k, value in w["sh_table"].items()}
 
-        # --- 1. シャンテン点 (0–50) ---
+        # --- 1. シャンテン点（設定テーブル、既定0–100） ---
         sh_score = _sh_table.get(sh, max(0, 4 - sh))
 
         # --- 2. 重み付き受け入れ枚数点 ---
@@ -428,6 +460,8 @@ def _evaluate_hand_raw(hand_14, context=None):
             "sh": sh,
             "acc": type_count,
             "weighted_acc": weighted_count,
+            "context_key": context_features["key"],
+            "context": context_features,
             "safety_raw": safety_raw,
             "sh_score": round(sh_score, 1),
             "acc_score": round(acc_score, 1),
@@ -438,31 +472,45 @@ def _evaluate_hand_raw(hand_14, context=None):
             "label": tile_to_label(tile),
         })
 
-    results.sort(key=lambda c: -c["raw_total"])
+    results.sort(key=lambda c: (c["sh"], -c["raw_total"], -c["weighted_acc"], c["idx"]))
     return results
 
 
 def _normalize_to_100(candidates):
     """
-    AI最善手を100点として、各候補を比例スコアで正規化する。
-    最善手=100点、他は best_raw に対する比率で算出。
+    AI最善手を100点として各候補を正規化する。
+    同シャンテンでは素スコア比、シャンテン戻しには1段階25点の上限を適用する。
     """
     if not candidates:
         return candidates
     best_raw = candidates[0]["raw_total"]
-    for c in candidates:
+    best_shanten = candidates[0]["sh"]
+    for candidate in candidates:
         if best_raw > 0:
-            c["total_score"] = round(min(100.0, c["raw_total"] / best_raw * 100), 1)
+            normalized = candidate["raw_total"] / best_raw * 100
         else:
-            c["total_score"] = 100.0
+            normalized = 100.0 if candidate is candidates[0] else 0.0
+        shanten_gap = max(0, candidate["sh"] - best_shanten)
+        shanten_cap = max(0.0, 100.0 - shanten_gap * 25.0)
+        candidate["total_score"] = round(min(100.0, normalized, shanten_cap), 1)
     return candidates
 
 
 def _evaluate_hand_score(hand_14, context=None):
     """
     手牌から各打牌候補を「AI最善手=100点」で正規化スコアリング。
+    守備局面では安全度を第一キーにして、表示・実打牌・ログの順位を統一する。
     """
     raw = _evaluate_hand_raw(hand_14, context=context)
+    if _should_defend(hand_14, context):
+        raw.sort(
+            key=lambda candidate: (
+                -candidate["safety_raw"],
+                candidate["sh"],
+                -candidate["weighted_acc"],
+                candidate["idx"],
+            )
+        )
     return _normalize_to_100(raw)
 
 
@@ -613,22 +661,6 @@ def _should_defend(hand_14, context=None):
 
 
 def find_best_discard(hand_14, context=None):
-    # 守備モード: 最も安全な牌を選ぶ
-    if _should_defend(hand_14, context):
-        rivers = context.get("rivers") if context else None
-        player_name = context.get("player") if context else None
-        riichi_players = context.get("riichi", {}) if context else {}
-
-        best_idx = 0
-        best_safety = -1
-        for i, tile in enumerate(hand_14):
-            safety = _tile_safety_score(tile, rivers, player_name, riichi_players)
-            if safety > best_safety:
-                best_safety = safety
-                best_idx = i
-        remaining = hand_14[:best_idx] + hand_14[best_idx + 1:]
-        return best_idx, calculate_shanten(remaining)
-
     candidates = _evaluate_hand_score(hand_14, context=context)
     if not candidates:
         return 0, 99
