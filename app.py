@@ -682,11 +682,11 @@ for p in PLAYER_ORDER:
 if GS["eval_history"] and show_ai_eval:
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 AI評価サマリー")
-    strictly_best = sum(1 for e in GS["eval_history"] if e.get("is_strictly_best", False))
+    best_moves = game_log.count_best_moves(GS["eval_history"])
     total = len(GS["eval_history"])
-    rate = (strictly_best / total * 100) if total > 0 else 0
+    rate = (best_moves / total * 100) if total > 0 else 0
     avg_score = sum(e.get("total_score", 0) for e in GS["eval_history"]) / total if total > 0 else 0
-    st.sidebar.markdown(f"最善手率: **{rate:.0f}%** ({strictly_best}/{total})")
+    st.sidebar.markdown(f"最善手率: **{rate:.0f}%** ({best_moves}/{total})")
     st.sidebar.markdown(f"平均スコア: **{avg_score:.1f}** /100点")
 
 # --- AIチューニング用語解説 ---

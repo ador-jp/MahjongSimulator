@@ -6,6 +6,7 @@ from pathlib import Path
 
 import ai_weights
 import game_log
+import game_logic
 import learning
 import simulation
 
@@ -231,6 +232,42 @@ class SimulationPipelineTests(unittest.TestCase):
             {"acc_norm": 20.0},
             ai_weights.get()["context_profiles"][context_key],
         )
+
+
+class BestMoveRateTests(unittest.TestCase):
+    def test_discard_tied_with_ai_top_score_counts_as_best_move(self):
+        hand = [
+            "1m", "2m", "3m", "4p", "5p", "6p", "7s",
+            "8s", "9s", "2m", "3m", "5s", "1z", "7z",
+        ]
+        context = {
+            "player": "Player",
+            "rivers": {},
+            "riichi": {},
+            "wall_count": 60,
+            "scores": {
+                "Player": 25000,
+                "CPU1": 25000,
+                "CPU2": 25000,
+                "CPU3": 25000,
+            },
+        }
+        chun_idx = hand.index("7z")
+        tied = game_logic.evaluate_discard(hand, chun_idx, context=context)
+        self.assertFalse(tied["is_strictly_best"])
+        self.assertNotEqual("7z", tied["best_tile"])
+        self.assertEqual(100.0, tied["total_score"])
+
+        best_idx = hand.index(tied["best_tile"])
+        best = game_logic.evaluate_discard(hand, best_idx, context=context)
+        worse = game_logic.evaluate_discard(hand, hand.index("2m"), context=context)
+        self.assertLess(worse["total_score"], 100.0)
+
+        self.assertTrue(game_log.is_best_move(tied))
+        self.assertTrue(game_log.is_best_move(best))
+        self.assertFalse(game_log.is_best_move(worse))
+        self.assertFalse(game_log.is_best_move({"grade": "—", "is_strictly_best": False}))
+        self.assertEqual(2, game_log.count_best_moves([tied, best, worse]))
 
 
 if __name__ == "__main__":

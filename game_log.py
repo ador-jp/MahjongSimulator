@@ -74,6 +74,19 @@ def _decision_snapshot(
     }
 
 
+def is_best_move(eval_result: dict) -> bool:
+    """AI最善手と同点（100点）の打牌も最善手として扱う。"""
+    if eval_result.get("is_strictly_best", False):
+        return True
+    if "total_score" not in eval_result:
+        return False
+    return eval_result["total_score"] >= eval_result.get("best_score", 100.0)
+
+
+def count_best_moves(eval_results: list) -> int:
+    return sum(1 for eval_result in eval_results if is_best_move(eval_result))
+
+
 def make_player_decision(
     round_number: int,
     turn_count: int,
