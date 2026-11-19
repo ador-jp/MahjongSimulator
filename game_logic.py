@@ -1049,7 +1049,13 @@ def evaluate_discard(hand_14, player_discard_idx, context=None):
 
     # Top3候補
     top_candidates = []
-    for c in all_candidates[:3]:
+    seen_tiles = set()
+    for c in all_candidates:
+        if len(top_candidates) == 3:
+            break
+        if c["tile"] in seen_tiles:
+            continue
+        seen_tiles.add(c["tile"])
         c_copy = dict(c)
         c_copy["danger_description"] = _generate_situation_comment(
             c["tile"], rivers, player_name, context=context
