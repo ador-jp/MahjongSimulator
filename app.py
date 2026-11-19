@@ -303,20 +303,9 @@ def _finalize_and_save_log(game_result: dict, scores_before: dict):
     )
 
 
-def _discard_min_required():
-    """副露有無に応じた打牌に必要な最低手牌枚数"""
-    has_meld = bool(GS["melds"]["Player"])
-    meld_count = len(GS["melds"]["Player"])
-    # 副露1回=11枚+1枚ツモ=12枚から打牌, 2回=8枚+1=9枚, etc.
-    if has_meld:
-        return 13 - meld_count * 3 + 1  # ポン後11枚→打牌で10枚、ツモで11枚→…
-    return 14
-
-
 def handle_player_discard(idx):
     """プレイヤーの打牌処理 + AI評価"""
     hand = GS["hands"]["Player"]
-    has_meld = bool(GS["melds"]["Player"])
     meld_count = len(GS["melds"]["Player"])
     # 副露なし: 14枚から打牌, 1副露: 12枚から打牌, 2副露: 9枚から打牌
     min_required = 14 - meld_count * 3
