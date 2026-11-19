@@ -6,6 +6,7 @@ from pathlib import Path
 
 import ai_weights
 import game_log
+import game_logic
 import learning
 import simulation
 
@@ -231,6 +232,74 @@ class SimulationPipelineTests(unittest.TestCase):
             {"acc_norm": 20.0},
             ai_weights.get()["context_profiles"][context_key],
         )
+
+
+class BestMoveRateTests(unittest.TestCase):
+    def test_discard_tied_with_ai_top_score_counts_as_best_move(self):
+        hand = [
+            "1m", "2m", "3m", "4p", "5p", "6p", "7s",
+            "8s", "9s", "2m", "3m", "5s", "1z", "7z",
+        ]
+        context = {
+            "player": "Player",
+            "rivers": {},
+            "riichi": {},
+            "wall_count": 60,
+            "scores": {
+                "Player": 25000,
+                "CPU1": 25000,
+                "CPU2": 25000,
+                "CPU3": 25000,
+            },
+        }
+        chun_idx = hand.index("7z")
+        tied = game_logic.evaluate_discard(hand, chun_idx, context=context)
+        self.assertFalse(tied["is_strictly_best"])
+        self.assertNotEqual("7z", tied["best_tile"])
+        self.assertEqual(100.0, tied["total_score"])
+
+        best_idx = hand.index(tied["best_tile"])
+        best = game_logic.evaluate_discard(hand, best_idx, context=context)
+        worse = game_logic.evaluate_discard(hand, hand.index("2m"), context=context)
+        self.assertLess(worse["total_score"], 100.0)
+
+        self.assertTrue(game_log.is_best_move(tied))
+        self.assertTrue(game_log.is_best_move(best))
+        self.assertFalse(game_log.is_best_move(worse))
+        self.assertFalse(game_log.is_best_move({"grade": "—", "is_strictly_best": False}))
+        self.assertEqual(2, game_log.count_best_moves([tied, best, worse]))
+
+    def test_dangerous_discard_rounded_to_100_in_defense_is_not_best_move(self):
+        hand = [
+            "6z", "7s", "2p", "8p", "1p", "3s", "8s",
+            "2z", "5m", "2m", "9s", "7p", "1s", "8m",
+        ]
+        context = {
+            "player": "Player",
+            "rivers": {
+                "CPU1": ["4m", "9p", "1z"],
+                "CPU2": ["2m", "4p", "9m"],
+                "CPU3": [],
+            },
+            "riichi": {"CPU1": True, "CPU2": True},
+            "wall_count": 40,
+            "scores": {
+                "Player": 25000,
+                "CPU1": 24000,
+                "CPU2": 24000,
+                "CPU3": 25000,
+            },
+        }
+        dangerous = game_logic.evaluate_discard(hand, hand.index("6z"), context=context)
+        self.assertFalse(dangerous["is_strictly_best"])
+        self.assertEqual(100.0, dangerous["total_score"])
+        best_candidate = dangerous["all_candidates"][0]
+        chosen_candidate = next(
+            c for c in dangerous["all_candidates"] if c["tile"] == "6z"
+        )
+        self.assertLess(chosen_candidate["safety_raw"], best_candidate["safety_raw"])
+
+        self.assertFalse(game_log.is_best_move(dangerous))
 
 
 if __name__ == "__main__":
