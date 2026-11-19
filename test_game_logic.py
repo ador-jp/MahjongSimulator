@@ -1,6 +1,6 @@
 import unittest
 
-from game_logic import find_best_discard, get_discard_candidates
+from game_logic import evaluate_discard, find_best_discard, get_discard_candidates
 
 
 class DiscardEvaluationTests(unittest.TestCase):
@@ -61,6 +61,37 @@ class DiscardEvaluationTests(unittest.TestCase):
         selected_idx, _ = find_best_discard(hand, context=context)
 
         self.assertEqual("5m", hand[selected_idx])
+
+    def test_top_candidates_list_each_tile_once(self):
+        hand = [
+            "2m", "1s", "8m", "5s", "2m", "7p", "6p",
+            "6s", "7p", "6m", "2z", "4p", "1m", "8p",
+        ]
+        context = {
+            "player": "Player",
+            "rivers": {},
+            "riichi": {},
+            "wall_count": 60,
+            "scores": {
+                "Player": 25000,
+                "CPU1": 25000,
+                "CPU2": 25000,
+                "CPU3": 25000,
+            },
+        }
+
+        raw_top_tiles = [
+            candidate["tile"]
+            for candidate in get_discard_candidates(hand, context=context, top_k=3)
+        ]
+        self.assertLess(len(set(raw_top_tiles)), 3)
+
+        result = evaluate_discard(hand, 0, context=context)
+        top_tiles = [candidate["tile"] for candidate in result["top_candidates"]]
+
+        self.assertEqual(3, len(top_tiles))
+        self.assertEqual(len(top_tiles), len(set(top_tiles)))
+        self.assertEqual(result["best_tile"], top_tiles[0])
 
 
 if __name__ == "__main__":
