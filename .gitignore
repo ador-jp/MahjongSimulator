@@ -2,3 +2,6 @@ __pycache__/
 .DS_Store
 .venv/
 .vscode/
+# Self-play logs are several GB; regenerated locally by simulation.py
+game_logs.jsonl
+analysis_cache.json
