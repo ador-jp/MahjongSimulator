@@ -9,7 +9,7 @@
 """
 import json
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 LOG_PATH = Path(__file__).parent / "game_logs.jsonl"
 
