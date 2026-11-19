@@ -1,6 +1,7 @@
 import streamlit as st
 import random
 import time
+import json
 import base64
 from functools import lru_cache
 from pathlib import Path
@@ -9,6 +10,8 @@ import streamlit.components.v1 as _components
 from st_clickable_images import clickable_images
 import ai_weights
 import game_log
+import learning
+import simulation
 from game_logic import _evaluate_hand_score as _eval_candidates
 
 # 起動時にai_weights.jsonを読み込む（チューニング済みパラメータを反映）
@@ -435,17 +438,21 @@ def handle_cpu_turn(cp):
         st.rerun()
         return
 
-    # 最適打牌
     context = {
-        "rivers": GS["rivers"], "scores": GS["scores"],
-        "player": cp, "wall_count": len(GS["wall"]),
+        "rivers": GS["rivers"],
+        "scores": GS["scores"],
+        "player": cp,
+        "wall_count": len(GS["wall"]),
         "riichi": GS["riichi"],
         "dora_indicators": GS.get("dora_indicators", [GS["dora_indicator"]]),
+        "melds": GS["melds"].get(cp),
     }
-    best_idx, _ = find_best_discard(GS["hands"][cp], context=context)
 
-    # 牌譜ログ（全候補スコアを取得して記録）
+    # 評価と実打牌で同じ候補列を共有し、重い評価の二重実行を避ける
     _cpu_candidates = _eval_candidates(GS["hands"][cp], context=context)
+    if not _cpu_candidates:
+        return
+    best_idx = _cpu_candidates[0]["idx"]
     GS["decision_log"].append(game_log.make_cpu_decision(
         round_number=GS["round_number"],
         turn_count=GS["turn_count"],
@@ -522,14 +529,146 @@ def handle_cpu_turn(cp):
 # ==========================================
 # 2. UI 表示
 # ==========================================
-st.set_page_config(layout="wide")
+st.set_page_config(
+    page_title="Mahjong AI Lab",
+    page_icon="🀄",
+    layout="wide",
+)
 
 # --- サイドバー ---
 st.sidebar.title("🀄 メニュー")
-auto_play = st.sidebar.checkbox("⚡ 高速オートプレイ", value=False)
+auto_play = st.sidebar.checkbox("盤面をオート進行", value=False)
 show_ai_eval = st.sidebar.checkbox("🤖 AI評価を表示", value=True)
 show_hover = st.sidebar.checkbox("🔍 牌ホバー情報を表示", value=False)
 st.sidebar.button("🔄 リセット", on_click=lambda: st.session_state.clear())
+
+# --- ヘッドレス高速シミュレーション ---
+def _on_continuous_learning_change():
+    if st.session_state.get("_continuous_learning_enabled", False):
+        st.session_state.pop("_continuous_summary", None)
+        st.session_state.pop("_continuous_records", None)
+        st.session_state.pop("_continuous_error", None)
+        st.session_state.pop("_context_evaluation", None)
+    st.rerun()
+
+
+@st.fragment(run_every="1s")
+def _continuous_learning_controls():
+    enabled = st.toggle(
+        "連続学習",
+        key="_continuous_learning_enabled",
+        on_change=_on_continuous_learning_change,
+        help="ONの間、ランダムseedで半荘を繰り返して牌譜と分析を更新します。",
+    )
+    summary = st.session_state.get("_continuous_summary")
+    if not enabled:
+        if summary:
+            st.success(
+                f"停止中: {summary['games']}半荘・{summary['rounds']}局を分析済み",
+                icon=":material/pause_circle:",
+            )
+        else:
+            st.caption("ONにすると、半荘数とseedの指定なしで学習を開始します。")
+        return
+
+    st.caption("稼働中。OFF操作は現在の半荘が終わった時点で反映されます。")
+    if st.session_state.get("_continuous_error"):
+        st.error(st.session_state["_continuous_error"])
+        return
+
+    with st.spinner("ランダムseedで次の半荘を対局・分析しています"):
+        try:
+            summary, records = simulation.run_continuous_step(
+                summary,
+                st.session_state.get("_continuous_records"),
+            )
+        except Exception as error:
+            st.session_state["_continuous_error"] = str(error)
+            st.exception(error)
+            return
+
+    st.session_state["_continuous_summary"] = summary
+    st.session_state["_continuous_records"] = records
+    st.session_state["_batch_summary"] = summary
+    game_log.save_analysis_cache(summary["analysis"])
+    st.metric(
+        "連続学習",
+        f"{summary['games']}半荘 / {summary['rounds']}局",
+        delta=f"{summary['rounds_per_second']:.2f} 局/秒",
+    )
+    st.caption(
+        f"最新seed: `{summary['latest_seed']}` / "
+        f"直近{summary['analysis_window_rounds']}局を再分析"
+    )
+
+
+with st.sidebar.expander(
+    "高速AI学習",
+    expanded=False,
+    icon=":material/bolt:",
+):
+    st.caption("画面描画と待機を省き、AI同士の半荘を高速に実行します。")
+    _continuous_learning_controls()
+    continuous_enabled = st.session_state.get(
+        "_continuous_learning_enabled",
+        False,
+    )
+    st.markdown("**固定回数で実行**")
+    with st.form("batch_simulation_form"):
+        batch_games = st.number_input(
+            "半荘数",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            disabled=continuous_enabled,
+        )
+        batch_seed = st.number_input(
+            "再現用seed",
+            min_value=0,
+            value=20260915,
+            step=1,
+            disabled=continuous_enabled,
+        )
+        persist_batch_logs = st.checkbox(
+            "牌譜を保存",
+            value=True,
+            disabled=continuous_enabled,
+        )
+        run_batch = st.form_submit_button(
+            "対局・分析を実行",
+            type="primary",
+            icon=":material/play_arrow:",
+            width="stretch",
+            disabled=continuous_enabled,
+        )
+
+    if run_batch:
+        batch_progress = st.progress(0, text="対局を準備しています")
+
+        def _update_batch_progress(completed, total):
+            batch_progress.progress(
+                completed / total,
+                text=f"半荘 {completed}/{total} を完了",
+            )
+
+        try:
+            batch_summary = simulation.run_batch(
+                games=int(batch_games),
+                seed=int(batch_seed),
+                persist=persist_batch_logs,
+                progress=_update_batch_progress,
+            )
+        except Exception as error:
+            st.exception(error)
+        else:
+            st.session_state["_batch_summary"] = batch_summary
+            game_log.save_analysis_cache(batch_summary["analysis"])
+            batch_progress.empty()
+            st.success(
+                f"{batch_summary['rounds']}局を"
+                f"{batch_summary['elapsed_seconds']:.1f}秒で完了しました。"
+            )
 
 # --- 点数表示 ---
 st.sidebar.markdown("---")
@@ -600,9 +739,9 @@ with st.sidebar.expander("📊 牌譜分析・AIチューニング", expanded=Fa
 
     col_a, col_b = st.columns(2)
     with col_a:
-        run_analysis = st.button("🔍 分析実行", use_container_width=True)
+        run_analysis = st.button("🔍 分析実行", width="stretch")
     with col_b:
-        if st.button("🗑 ログ削除", use_container_width=True):
+        if st.button("🗑 ログ削除", width="stretch"):
             game_log.clear_logs()
             st.rerun()
 
@@ -638,17 +777,12 @@ with st.sidebar.expander("📊 牌譜分析・AIチューニング", expanded=Fa
                 f"安全:{cr.get('safety',0):+.1f}"
             )
 
-        # チューニング提案
-        weight_diff, notes = game_log.suggest_tuning(analysis)
-        st.markdown("**調整案:**")
+        # 集計だけの案は参考表示に留め、局面別A/B検証を通過するまで適用しない
+        _, notes = game_log.suggest_tuning(analysis)
+        st.markdown("**参考診断:**")
         for note in notes:
             st.caption(f"• {note}")
-
-        if weight_diff:
-            if st.button("⚙️ AIに適用して保存", type="primary", use_container_width=True):
-                game_log.apply_tuning(weight_diff)
-                st.success("重みを更新しました。次の局から反映されます。")
-                st.rerun()
+        st.caption("重みの反映は高速学習レポートのA/B検証後に行います。")
 
     # 現在の重みを表示
     with st.expander("現在のAI重み", expanded=False):
@@ -657,10 +791,280 @@ with st.sidebar.expander("📊 牌譜分析・AIチューニング", expanded=Fa
         st.caption(f"受け入れ: max={w['acc_max']:.1f} / norm={w['acc_norm']:.1f}")
         st.caption(f"ドラ: {w['dora_per_tile']:.1f}pt/枚 max={w['dora_max']:.1f}")
         st.caption(f"テンパイ bonus={w['tenpai_bonus']:.1f} / リーチ+={w['riichi_eligible_bonus']:.1f}")
-        if st.button("🔄 デフォルトにリセット", use_container_width=True):
+        if st.button("🔄 デフォルトにリセット", width="stretch"):
             ai_weights.reset_to_default()
             st.success("デフォルト重みに戻しました。")
             st.rerun()
+
+# --- 高速学習ダッシュボード ---
+batch_summary = st.session_state.get("_batch_summary")
+if batch_summary:
+    batch_analysis = batch_summary["analysis"]
+    with st.container(border=True):
+        st.subheader("高速AI学習レポート", icon=":material/analytics:")
+        if batch_summary.get("continuous"):
+            st.caption(
+                f"連続Run {batch_summary['run_id']} / "
+                f"最新seed {batch_summary['latest_seed']} / "
+                f"累計{batch_summary['elapsed_seconds']:.1f}秒 / "
+                f"直近{batch_summary['analysis_window_rounds']}局を分析"
+            )
+        else:
+            st.caption(
+                f"Run {batch_summary['run_id']} / seed {batch_summary['seed']} / "
+                f"{batch_summary['elapsed_seconds']:.1f}秒"
+            )
+        with st.container(horizontal=True):
+            st.metric("半荘", batch_summary["games"], border=True)
+            st.metric("局数", batch_summary["rounds"], border=True)
+            st.metric(
+                "処理速度",
+                f"{batch_summary['rounds_per_second']:.2f} 局/秒",
+                border=True,
+            )
+            st.metric(
+                "終盤聴牌率",
+                f"{batch_analysis.get('late_tenpai_rate', 0):.1f}%",
+                border=True,
+            )
+            st.metric(
+                "放銃局率",
+                f"{batch_analysis.get('ron_dealt_rate', 0):.1f}%",
+                border=True,
+            )
+
+        result_column, placement_column = st.columns(2)
+        with result_column:
+            st.markdown("**局結果**")
+            result_labels = {
+                "tsumo": "ツモ",
+                "ron": "ロン",
+                "exhaustive_draw": "流局",
+                "invalid": "無効",
+            }
+            result_rows = [
+                {"結果": result_labels.get(result, result), "局数": count}
+                for result, count in batch_summary["result_counts"].items()
+            ]
+            if result_rows:
+                st.bar_chart(result_rows, x="結果", y="局数")
+        with placement_column:
+            st.markdown("**Player順位**")
+            placement_rows = [
+                {"順位": f"{place}位", "半荘数": count}
+                for place, count in batch_summary["player_placements"].items()
+            ]
+            st.bar_chart(placement_rows, x="順位", y="半荘数")
+
+        st.markdown("**良かった点・改善点**")
+        for diagnostic in batch_analysis.get("diagnostics", []):
+            status = diagnostic.get("status")
+            message = f"**{diagnostic['title']}** — {diagnostic['detail']}"
+            if status == "good":
+                st.success(message, icon=":material/check_circle:")
+            elif status == "bad":
+                st.warning(message, icon=":material/warning:")
+            else:
+                st.info(message, icon=":material/info:")
+
+        st.markdown("**具体的な局面分析**")
+        batch_records = (
+            game_log.load_logs_for_run(
+                batch_summary["run_id"],
+                max_rounds=batch_summary.get("analysis_window_rounds", 500),
+            )
+            if batch_summary.get("persisted")
+            else []
+        )
+        if not batch_records:
+            st.info(
+                "局面別学習には、対局時に「牌譜を保存」を有効にしてください。",
+                icon=":material/database:",
+            )
+        else:
+            decision_examples = learning.extract_decision_examples(batch_records)
+            with st.expander(
+                "具体的な好手・悪手を見る",
+                icon=":material/find_in_page:",
+            ):
+                bad_rows = [
+                    {
+                        "状況": example["context_label"],
+                        "手牌": " ".join(example["hand"]),
+                        "選択": example["chosen"].get("tile"),
+                        "代替": (example.get("alternative") or {}).get("tile", "—"),
+                        "判断": example["reason"],
+                    }
+                    for example in decision_examples["bad"]
+                ]
+                good_rows = [
+                    {
+                        "状況": example["context_label"],
+                        "手牌": " ".join(example["hand"]),
+                        "選択": example["chosen"].get("tile"),
+                        "判断": example["reason"],
+                    }
+                    for example in decision_examples["good"]
+                ]
+                st.markdown("**改善すべき判断**")
+                if bad_rows:
+                    st.dataframe(bad_rows, hide_index=True)
+                else:
+                    st.caption("このRunでは説明可能な重大悪手を検出しませんでした。")
+                st.markdown("**良かった判断**")
+                if good_rows:
+                    st.dataframe(good_rows, hide_index=True)
+                else:
+                    st.caption("好手判定に十分な局面がありませんでした。")
+
+            context_proposal = learning.propose_context_weights(batch_records)
+            st.markdown("**局面別の重み候補**")
+            if not context_proposal["changes"]:
+                st.info(
+                    "局面別変更の根拠が不足しています。牌譜を追加してください。",
+                    icon=":material/info:",
+                )
+            else:
+                st.dataframe(
+                    [
+                        {
+                            "対象局面": change["label"],
+                            "判断数": change["sample_size"],
+                            "変更": json.dumps(change["profile"], ensure_ascii=False),
+                            "根拠": " / ".join(change["reasons"]),
+                        }
+                        for change in context_proposal["changes"]
+                    ],
+                    hide_index=True,
+                )
+                st.caption(
+                    "採用条件: 学習seed・未使用seedの両方で、平均点差と平均順位が改善し、"
+                    "放銃局率と終盤聴牌率が悪化しないこと。"
+                )
+                evaluation_rounds = st.number_input(
+                    "A/B検証の局数（学習用・未使用seed用それぞれ）",
+                    min_value=1,
+                    max_value=30,
+                    value=4,
+                    step=1,
+                    key=f"evaluation_rounds_{batch_summary['run_id']}",
+                )
+                max_ui_seed = (1 << 53) - 1
+                evaluation_seed = st.number_input(
+                    "A/B検証seed",
+                    min_value=0,
+                    max_value=max_ui_seed,
+                    value=min(int(batch_summary["seed"]), max_ui_seed),
+                    step=1,
+                    key=f"evaluation_seed_safe_{batch_summary['run_id']}",
+                )
+                if st.button(
+                    "同一seed A/Bと未使用seed検証を実行",
+                    type="primary",
+                    icon=":material/science:",
+                    key=f"evaluate_context_{batch_summary['run_id']}",
+                ):
+                    evaluation_status = st.status(
+                        "局面別重みを検証しています",
+                        expanded=True,
+                    )
+                    stage_labels = {
+                        "training_baseline": "学習seed: 現行AI",
+                        "training_candidate": "学習seed: 候補AI",
+                        "validation_baseline": "未使用seed: 現行AI",
+                        "validation_candidate": "未使用seed: 候補AI",
+                    }
+
+                    def _show_evaluation_stage(stage, completed, total):
+                        evaluation_status.write(
+                            f"{completed}/{total} {stage_labels[stage]}"
+                        )
+
+                    context_evaluation = learning.evaluate_context_candidate(
+                        context_proposal,
+                        seed=int(evaluation_seed),
+                        training_rounds=int(evaluation_rounds),
+                        validation_rounds=int(evaluation_rounds),
+                        progress=_show_evaluation_stage,
+                    )
+                    st.session_state["_context_evaluation"] = {
+                        "run_id": batch_summary["run_id"],
+                        "result": context_evaluation,
+                    }
+                    evaluation_status.update(
+                        label="A/B検証が完了しました",
+                        state="complete",
+                    )
+
+                stored_evaluation = st.session_state.get("_context_evaluation", {})
+                if stored_evaluation.get("run_id") == batch_summary["run_id"]:
+                    context_evaluation = stored_evaluation["result"]
+                    comparison_rows = []
+                    for label, comparison in (
+                        ("学習seed", context_evaluation["training"]),
+                        ("未使用seed", context_evaluation["validation"]),
+                    ):
+                        comparison_rows.append({
+                            "データ": label,
+                            "平均点差の改善": comparison["score_gain"],
+                            "平均順位の改善": comparison["placement_gain"],
+                            "勝率差": comparison["win_rate_gain"],
+                            "放銃局率差": comparison["deal_in_rate_change"],
+                            "終盤聴牌率差": comparison["late_tenpai_rate_change"],
+                        })
+                    st.dataframe(comparison_rows, hide_index=True)
+
+                    if context_evaluation["accepted"]:
+                        st.success(
+                            "学習seedと未使用seedの両方で採用基準を通過しました。",
+                            icon=":material/verified:",
+                        )
+                        applied_runs = st.session_state.get(
+                            "_applied_context_runs", []
+                        )
+                        if batch_summary["run_id"] in applied_runs:
+                            st.success("この局面学習は反映済みです。")
+                        elif st.button(
+                            "検証済みの局面学習をAIへ反映",
+                            type="primary",
+                            icon=":material/neurology:",
+                            key=f"apply_context_{batch_summary['run_id']}",
+                        ):
+                            learning.apply_validated_candidate(context_evaluation)
+                            st.session_state["_applied_context_runs"] = [
+                                *applied_runs,
+                                batch_summary["run_id"],
+                            ]
+                            st.toast("検証済みの局面重みを保存しました。")
+                            st.rerun()
+                    else:
+                        st.warning(
+                            "採用基準を満たさなかったため、AI重みは変更しません。",
+                            icon=":material/block:",
+                        )
+
+        st.download_button(
+            "分析結果をJSONで保存",
+            data=json.dumps(batch_summary, ensure_ascii=False, indent=2),
+            file_name=f"mahjong-ai-{batch_summary['run_id']}.json",
+            mime="application/json",
+            icon=":material/download:",
+        )
+
+        tuning_history = game_log.load_tuning_history(max_entries=5)
+        if tuning_history:
+            with st.expander("直近のAI調整履歴", icon=":material/history:"):
+                st.dataframe(
+                    [
+                        {
+                            "適用元": record.get("source", ""),
+                            "変更": json.dumps(record.get("diff", {}), ensure_ascii=False),
+                            "対象局数": record.get("metrics", {}).get("total_rounds"),
+                        }
+                        for record in reversed(tuning_history)
+                    ],
+                    hide_index=True,
+                )
 
 # --- 場・局・風表示 ---
 round_info = get_round_info(GS["round_number"])
